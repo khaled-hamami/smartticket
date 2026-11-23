@@ -1,0 +1,157 @@
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import * as bcrypt from 'bcrypt';
+import { User } from './entities/user.entity';
+import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { UserAuthority } from '../common/enums/user-authority.enum';
+import { TeamsService } from '../teams/teams.service';
+import { CacheService } from '../cache/cache.service';
+
+const SALT_ROUNDS = 10;
+
+@Injectable()
+export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+  constructor(
+    @InjectRepository(User)
+    private readonly usersRepository: Repository<User>,
+    private readonly teamsService: TeamsService,
+    private readonly cache: CacheService,
+  ) {}
+
+  // Règle métier : un seul PMO actif dans toute l'application.
+  async assertSinglePmo(authority: string | undefined, valid: boolean | undefined, selfId?: number): Promise<void> {
+    if (authority !== UserAuthority.PMO || valid === false) return;
+    const other = await this.usersRepository.findOne({ where: { authority: UserAuthority.PMO, valid: true } });
+    if (other && (selfId === undefined || String(other.id) !== String(selfId))) {
+      throw new ConflictException({
+        statusCode: 409, error: 'Conflict', code: 'PMO_ALREADY_EXISTS',
+        message: 'Il ne peut y avoir qu\'un seul PMO actif. Pour passer la main, utilisez « Démissionner » (invitation d\'un successeur).',
+      });
+    }
+  }
+
+  async create(dto: CreateUserDto): Promise<User> {
+    await this.assertSinglePmo(dto.authority, dto.valid ?? true);
+    const existing = await this.usersRepository.findOne({
+      where: { email: dto.email },
+    });
+    if (existing) {
+      throw new ConflictException('Un utilisateur avec cet email existe déjà.');
+    }
+
+    const passwordHash = await bcrypt.hash(dto.password, SALT_ROUNDS);
+    const { password, ...rest } = dto;
+
+    const user = this.usersRepository.create({
+      ...rest,
+      passwordHash,
+    });
+    // Relecture : l'entité sauvegardée contient encore passwordHash (select:false ne s'applique qu'aux lectures).
+    const saved = await this.usersRepository.save(user);
+    const created = await this.findOne(saved.id);
+    await this.invalidateCache();
+    return created;
+  }
+
+  findAll(): Promise<User[]> {
+    return this.usersRepository.find();
+  }
+
+  // Utilisé par AuthService.bootstrap() pour vérifier que la table `users`
+  // est vide avant d'autoriser la création du tout premier compte.
+  count(): Promise<number> {
+    return this.usersRepository.count();
+  }
+
+  async findOne(id: number): Promise<User> {
+    const user = await this.usersRepository.findOne({ where: { id } });
+    if (!user) {
+      throw new NotFoundException(`Utilisateur ${id} introuvable.`);
+    }
+    return user;
+  }
+
+  // Utilisé par JwtStrategy à chaque requête authentifiée : renvoie null si le
+  // compte n'existe plus ou est désactivé (valid = false).
+  findActiveById(id: number | string): Promise<User | null> {
+    return this.usersRepository.findOne({ where: { id: Number(id), valid: true } });
+  }
+
+  // Utilisé uniquement par AuthService : inclut le password_hash normalement exclu par défaut.
+  findByEmailWithPassword(email: string): Promise<User | null> {
+    return this.usersRepository
+      .createQueryBuilder('user')
+      .addSelect('user.passwordHash')
+      .where('user.email = :email', { email })
+      .getOne();
+  }
+
+  async update(id: number, dto: UpdateUserDto, actorId?: number): Promise<User> {
+    const user = await this.findOne(id);
+
+    // R7 : on ne peut pas se désactiver ni changer son propre rôle (risque de s'enfermer dehors).
+    if (actorId !== undefined && Number(actorId) === Number(user.id)) {
+      if (dto.valid === false || (dto.authority !== undefined && dto.authority !== user.authority)) {
+        throw new ConflictException({
+          statusCode: 409, error: 'Conflict', code: 'SELF_ACTION_FORBIDDEN',
+          message: 'Vous ne pouvez pas désactiver votre propre compte ni changer votre propre rôle.',
+        });
+      }
+    }
+
+    // Un seul PMO actif : ni promotion en PMO, ni réactivation d'un ancien PMO s'il y en a déjà un.
+    await this.assertSinglePmo(dto.authority ?? user.authority, dto.valid ?? user.valid, user.id);
+
+    // Phase 2 : un membre d'équipe est forcément un technicien actif.
+    if (dto.authority !== undefined && dto.authority !== UserAuthority.TECHNICIAN) {
+      await this.teamsService.assertNotMember(user.id, 'changer le rôle');
+    }
+    // valid = false sur un membre : retrait de l'équipe + succession éventuelle + sauvegarde
+    // du compte dans la MÊME transaction (refusé en 409 s'il est le dernier membre).
+    if (dto.valid === false) {
+      const result = await this.teamsService.deactivateMember(user.id, (manager) => {
+        Object.assign(user, dto);
+        return manager.save(User, user);
+      });
+      if (result.handled && result.user) {
+        await this.invalidateCache();
+        return result.user;
+      }
+    }
+
+    Object.assign(user, dto);
+    const saved = await this.usersRepository.save(user);
+    await this.invalidateCache();
+    return saved;
+  }
+
+  async remove(id: number, actorId?: number): Promise<void> {
+    const user = await this.findOne(id);
+    if (actorId !== undefined && Number(actorId) === Number(user.id)) {
+      throw new ConflictException({
+        statusCode: 409, error: 'Conflict', code: 'SELF_ACTION_FORBIDDEN',
+        message: 'Vous ne pouvez pas supprimer votre propre compte.',
+      });
+    }
+    // Phase 2 : supprimer un membre contournerait les règles d'effectif (FK RESTRICT en base).
+    await this.teamsService.assertNotMember(user.id, 'supprimer ce compte');
+    await this.usersRepository.remove(user);
+    await this.invalidateCache();
+  }
+
+  private async invalidateCache(): Promise<void> {
+    try {
+      await this.cache.invalidateResource('user');
+    } catch (error) {
+      this.logger.warn(`Cache invalidation failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+  }
+}

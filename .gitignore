@@ -1,0 +1,10 @@
+node_modules/
+.next/
+dist/
+.env
+backend/.env
+frontend/.env
+*.log
+backend/uploads/
+startup.bat
+startup.txt

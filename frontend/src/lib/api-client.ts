@@ -1,0 +1,117 @@
+import { clearSession, getToken } from "./session";
+import { cachedGet, clearApiCache } from "./api-cache";
+
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001").replace(/\/$/, "");
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+interface ApiOptions {
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  body?: unknown;
+  // Pour /auth/login et /auth/bootstrap : un 401/409 est une erreur de formulaire,
+  // pas une session expirée -> pas de redirection automatique.
+  skipAuthRedirect?: boolean;
+}
+
+// Nest renvoie { message: string | string[], statusCode, error }.
+function extractMessage(data: unknown, fallback: string): string {
+  if (data && typeof data === "object" && "message" in data) {
+    const m = (data as { message: unknown }).message;
+    if (Array.isArray(m)) return m.join(" · ");
+    if (typeof m === "string") return m;
+  }
+  return fallback;
+}
+
+export function apiFetch<T = unknown>(path: string, options: ApiOptions = {}): Promise<T> {
+  const { method = "GET" } = options;
+  if (method === "GET") {
+    // Clé liée au jeton : jamais de données partagées entre deux sessions.
+    return cachedGet<T>(`${getToken() ?? ""}|${path}`, () => request<T>(path, options));
+  }
+  // Toute écriture invalide le cache (avant et après, pour couvrir les lectures en vol).
+  clearApiCache();
+  return request<T>(path, options).finally(clearApiCache);
+}
+
+export async function apiMultipart<T = unknown>(path: string, file: File): Promise<T> {
+  clearApiCache();
+  const form = new FormData();
+  form.append("file", file);
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  try {
+    const res = await fetch(`${API_URL}${path}`, { method: "POST", headers, body: form, cache: "no-store" });
+    const text = await res.text();
+    let data: unknown;
+    if (text) {
+      try { data = JSON.parse(text); } catch { data = text; }
+    }
+    if (!res.ok) {
+      if (res.status === 401) {
+        clearSession();
+        if (typeof window !== "undefined" && window.location.pathname !== "/login") window.location.href = "/login";
+      }
+      throw new ApiError(res.status, extractMessage(data, `Erreur ${res.status}`));
+    }
+    return data as T;
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(0, `Impossible de joindre l'API (${API_URL}). Le backend est-il démarré ?`);
+  } finally {
+    clearApiCache();
+  }
+}
+
+async function request<T>(path: string, options: ApiOptions): Promise<T> {
+  const { method = "GET", body, skipAuthRedirect = false } = options;
+
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(0, `Impossible de joindre l'API (${API_URL}). Le backend est-il démarré ?`);
+  }
+
+  // Corps potentiellement vide (ex. DELETE) : on lit le texte puis on parse si besoin.
+  const text = await res.text();
+  let data: unknown = undefined;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!res.ok) {
+    if (res.status === 401 && !skipAuthRedirect) {
+      clearSession();
+      if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+        window.location.href = "/login";
+      }
+    }
+    throw new ApiError(res.status, extractMessage(data, `Erreur ${res.status}`));
+  }
+
+  return data as T;
+}
